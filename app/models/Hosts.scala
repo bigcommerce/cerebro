@@ -80,37 +80,47 @@ class HostsImpl @Inject()(config: Configuration, client: WSClient)(implicit syst
       val host = hostConf.getOptional[String]("host").get
       val name = hostConf.getOptional[String]("name").getOrElse(host)
       val headersWhitelist = hostConf.getOptional[Seq[String]](path = "headers-whitelist").getOrElse(Seq.empty[String])
-      var i = 0
-      var attemptedCredentials = List.empty[Option[models.Host]]
-      while (i < 10 && attemptedCredentials.flatten.isEmpty) {
-        attemptedCredentials = (for (failoverAuth <- List("auth", "auth2")) yield {
-          log.info(s"Testing credentials provided in block ${failoverAuth}")
-          val username = hostConf.getOptional[String](s"$failoverAuth.username").getOrElse("")
-          val password = hostConf.getOptional[String](s"$failoverAuth.password").getOrElse("")
-          val creds = Host(host, Some(ESAuth(username, password)), headersWhitelist)
-          Await.result(clusterHealth(ElasticServer(creds, List())).map {
-            case Some(response) => (response) match {
+      // Gather all possible credentials
+      val credentials = List("auth", "auth2").flatMap { failoverAuth =>
+        val username = hostConf.getOptional[String](s"$failoverAuth.username").getOrElse("")
+        val password = hostConf.getOptional[String](s"$failoverAuth.password").getOrElse("")
+        if (username.nonEmpty && password.nonEmpty) Some(ESAuth(username, password)) else None
+      }
+      if (credentials.isEmpty) {
+        // No credentials provided, do not attempt authentication
+        log.info(s"No credentials provided for host $name, will not attempt authentication.")
+        name -> Host(host, None, headersWhitelist)
+      } else {
+        var i = 0
+        var attemptedCredentials = List.empty[Option[models.Host]]
+        while (i < 10 && attemptedCredentials.flatten.isEmpty) {
+          attemptedCredentials = credentials.map { cred =>
+            log.info(s"Testing credentials for user ${cred.username}")
+            val creds = Host(host, Some(cred), headersWhitelist)
+            Await.result(clusterHealth(ElasticServer(creds, List())).map {
+              case Some(response) => response match {
                 case elastic.Success(status, health) => Some(creds)
                 case elastic.Error(status, error) => None
-            }
-            case None => None
-          }, Duration.Inf)
-        })
-        if (attemptedCredentials.flatten.isEmpty) {
-          log.info("Backing off for 5s...")
-          Thread.sleep(5000)
-          log.info("Retrying credentials...")
+              }
+              case None => None
+            }, Duration.Inf)
+          }
+          if (attemptedCredentials.flatten.isEmpty) {
+            log.info("Backing off for 5s...")
+            Thread.sleep(5000)
+            log.info("Retrying credentials...")
+          }
+          i += 1
         }
-        i += 1
-      }
-      try {
-        val okCreds = attemptedCredentials.flatten.head
-        log.info(s"Found successful credentials; will use ${okCreds.authentication.get.username}.")
-        name -> okCreds
-      } catch {
-        case e => 
-        log.error(s"Missing credentials: ${e.getMessage}", throw MissingHostsCredentials(s"None of the provided credentials worked for '${name}', on '${host}'"))
-        name -> Host(host, Some(ESAuth("MISSING_USERNAME","MISSING_PASSWORD")), headersWhitelist)
+        try {
+          val okCreds = attemptedCredentials.flatten.head
+          log.info(s"Found successful credentials; will use ${okCreds.authentication.get.username}.")
+          name -> okCreds
+        } catch {
+          case e =>
+            log.error(s"Missing credentials: ${e.getMessage}", throw MissingHostsCredentials(s"None of the provided credentials worked for '${name}', on '${host}'"))
+            name -> Host(host, None, headersWhitelist)
+        }
       }
     }.toMap
     case Failure(_) => Map()
